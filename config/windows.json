@@ -1,0 +1,8 @@
+{
+  "zone": "America/Chicago",
+  "thresholds": {
+    "EXPIRING_90": 90,
+    "EXPIRING_60": 60,
+    "EXPIRING_30": 30
+  }
+}
