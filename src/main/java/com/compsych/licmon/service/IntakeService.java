@@ -55,7 +55,11 @@ public final class IntakeService {
     public record Result(int inserted, int updated, int unchanged, List<RowIssue> errors, List<RowIssue> warnings) {
     }
 
-    public Result ingestCsv(Reader in) throws IOException {
+    /**
+     * @param asOf the business date of this intake. Recorded as {@code expirationKnownSince} on new
+     *             licenses and on licenses whose expiration date changed.
+     */
+    public Result ingestCsv(Reader in, LocalDate asOf) throws IOException {
         BufferedReader r = new BufferedReader(in);
         String header = r.readLine();
         if (header == null) throw new IllegalArgumentException("empty file");
@@ -128,7 +132,7 @@ public final class IntakeService {
             } else {
                 updated++;
             }
-            store.putLicense(new License(npi, number.trim(), state, exp.get(), now));
+            store.putLicense(new License(npi, number.trim(), state, exp.get(), asOf, now));
         }
         return new Result(inserted, updated, unchanged, errors, warnings);
     }

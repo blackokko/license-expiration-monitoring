@@ -32,7 +32,7 @@ class SnapshotFileTest {
 
         InMemoryStore s1 = file.load();
         s1.putProvider(new Provider("1234567890", "Ann", "Lee", CLOCK.instant()));
-        s1.putLicense(new License("1234567890", "NY-44821", "NY", exp, CLOCK.instant()));
+        s1.putLicense(new License("1234567890", "NY-44821", "NY", exp, exp.minusDays(365), CLOCK.instant()));
         assertEquals(1, new MonitorService(s1, POLICY, CLOCK).run(exp.minusDays(70)).surfaced().size());
         file.save(s1);
 
@@ -47,7 +47,7 @@ class SnapshotFileTest {
 
     @Test
     void licenseViewMatchesPrescribedJson() throws Exception {
-        License l = new License("1234567890", "NY-44821", "NY", LocalDate.of(2027, 5, 30), CLOCK.instant());
+        License l = new License("1234567890", "NY-44821", "NY", LocalDate.of(2027, 5, 30), LocalDate.of(2026, 11, 24), CLOCK.instant());
         String json = Json.MAPPER.writeValueAsString(LicenseView.of(l, Window.EXPIRING_90));
         assertEquals("{\"npi\":\"1234567890\",\"license_number\":\"NY-44821\",\"license_state\":\"NY\","
                 + "\"license_expiration\":\"2027-05-30\",\"window\":\"EXPIRING_90\"}", json);

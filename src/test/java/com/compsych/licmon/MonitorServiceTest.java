@@ -40,8 +40,13 @@ class MonitorServiceTest {
         monitor = new MonitorService(store, POLICY, CLOCK);
     }
 
+    /** A license we've known about for a year, so every window it passes through is ours to surface. */
     License lic(String state, String number, LocalDate exp) {
-        License l = new License("1234567890", number, state, exp, CLOCK.instant());
+        return lic(state, number, exp, exp.minusDays(365));
+    }
+
+    License lic(String state, String number, LocalDate exp, LocalDate knownSince) {
+        License l = new License("1234567890", number, state, exp, knownSince, CLOCK.instant());
         store.putLicense(l);
         return l;
     }
@@ -94,7 +99,61 @@ class MonitorServiceTest {
         assertEquals(1, got.size());
         assertEquals(EXPIRING_30, got.get(0).window());
         assertEquals(List.of(EXPIRING_90, EXPIRING_60), got.get(0).skippedWindows());
+        assertEquals(List.of(), got.get(0).passedBeforeKnown());
         assertEquals(List.of(EXPIRING_30), surfacedWindows(l));
+    }
+
+    @Test
+    void loadedAlreadyExpiredIsNotReportedAsSkipped() {
+        LocalDate loaded = EXP.plusDays(10);
+        lic("TX", "TX-5", EXP, loaded);
+        Surfacing s = monitor.run(loaded).surfaced().get(0);
+        assertEquals(EXPIRED, s.window());
+        assertEquals(List.of(), s.skippedWindows());
+        assertEquals(List.of(EXPIRING_90, EXPIRING_60, EXPIRING_30), s.passedBeforeKnown());
+    }
+
+    @Test
+    void loadedMidWindowThenMissedRunsSplitsKnownFromUnknown() {
+        LocalDate loaded = EXP.minusDays(45);           // in EXPIRING_60 when we learned of it
+        lic("NY", "NY-1", EXP, loaded);
+        Surfacing s = monitor.run(EXP.minusDays(20)).surfaced().get(0); // no run until now
+        assertEquals(EXPIRING_30, s.window());
+        assertEquals(List.of(EXPIRING_60), s.skippedWindows());       // we held it, missed it
+        assertEquals(List.of(EXPIRING_90), s.passedBeforeKnown());    // gone before we knew
+    }
+
+    @Test
+    void loadedOnEntryDayOfAWindowCountsThatWindowAsKnown() {
+        LocalDate loaded = POLICY.entryDate(EXPIRING_60, EXP);
+        lic("NY", "NY-1", EXP, loaded);
+        Surfacing s = monitor.run(EXP.minusDays(5)).surfaced().get(0);
+        assertEquals(List.of(EXPIRING_60), s.skippedWindows());
+        assertEquals(List.of(EXPIRING_90), s.passedBeforeKnown());
+    }
+
+    @Test
+    void correctedEarlierExpirationIsNotAMonitoringGap() {
+        License l = lic("NY", "NY-1", EXP);
+        monitor.run(EXP.minusDays(80));                // EXPIRING_90 for the original date
+        LocalDate today = EXP.minusDays(80);
+        LocalDate corrected = today.plusDays(10);      // feed says it actually expires much sooner
+        store.putLicense(new License(l.npi(), l.licenseNumber(), l.licenseState(), corrected, today, CLOCK.instant()));
+        Surfacing s = monitor.run(today).surfaced().get(0);
+        assertEquals(EXPIRING_30, s.window());
+        assertEquals(corrected, s.licenseExpiration());
+        assertEquals(List.of(), s.skippedWindows());
+        assertEquals(List.of(EXPIRING_90, EXPIRING_60), s.passedBeforeKnown());
+    }
+
+    @Test
+    void legacyRowWithoutKnownSinceFallsBackToUpdatedAt() {
+        // CLOCK is 2026-11-24; the license is already in EXPIRING_30 on that date.
+        LocalDate exp = LocalDate.of(2026, 12, 10);
+        store.putLicense(new License("1234567890", "NY-1", "NY", exp, null, CLOCK.instant()));
+        Surfacing s = monitor.run(LocalDate.of(2026, 11, 24)).surfaced().get(0);
+        assertEquals(List.of(), s.skippedWindows());
+        assertEquals(List.of(EXPIRING_90, EXPIRING_60), s.passedBeforeKnown());
     }
 
     @Test
@@ -120,7 +179,7 @@ class MonitorServiceTest {
         License l = lic("NY", "NY-1", EXP);
         monitor.run(EXP.minusDays(10));
         LocalDate renewed = EXP.plusYears(2);
-        store.putLicense(new License(l.npi(), l.licenseNumber(), l.licenseState(), renewed, CLOCK.instant()));
+        store.putLicense(new License(l.npi(), l.licenseNumber(), l.licenseState(), renewed, EXP.minusDays(5), CLOCK.instant()));
         assertEquals(0, monitor.run(EXP.minusDays(5)).surfaced().size()); // renewed: OK now
         List<Surfacing> got = monitor.run(renewed.minusDays(85)).surfaced();
         assertEquals(1, got.size());

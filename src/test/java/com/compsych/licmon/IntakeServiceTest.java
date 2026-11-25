@@ -22,8 +22,25 @@ class IntakeServiceTest {
     final InMemoryStore store = new InMemoryStore();
     final IntakeService intake = new IntakeService(store, CLOCK);
 
+    LocalDate asOf = LocalDate.of(2026, 11, 24);
+
+    @Test
+    void knownSinceSetOnInsertKeptWhenUnchangedResetWhenDateChanges() throws Exception {
+        String key = License.keyOf("NY", "NY-44821");
+        ingest("1234567890,Ann,Lee,NY-44821,NY,2027-05-30\n");
+        assertEquals(LocalDate.of(2026, 11, 24), store.license(key).orElseThrow().expirationKnownSince());
+
+        asOf = LocalDate.of(2026, 12, 15);
+        ingest("1234567890,Ann,Lee,NY-44821,NY,2027-05-30\n");
+        assertEquals(LocalDate.of(2026, 11, 24), store.license(key).orElseThrow().expirationKnownSince());
+
+        asOf = LocalDate.of(2027, 1, 5);
+        ingest("1234567890,Ann,Lee,NY-44821,NY,2029-05-30\n");
+        assertEquals(LocalDate.of(2027, 1, 5), store.license(key).orElseThrow().expirationKnownSince());
+    }
+
     IntakeService.Result ingest(String body) throws Exception {
-        return intake.ingestCsv(new StringReader(HEADER + body));
+        return intake.ingestCsv(new StringReader(HEADER + body), asOf);
     }
 
     @Test

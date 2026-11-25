@@ -79,11 +79,25 @@ public final class MonitorService {
         }
         if (!current.moreSevereThan(mostSevereSoFar)) return Optional.empty();
 
-        final Window floor = mostSevereSoFar;
-        List<Window> skipped = WindowPolicy.alertingWindowsBefore(current).stream()
-                .filter(w -> w.moreSevereThan(floor))
-                .toList();
+        // Windows between what we last surfaced and now were never surfaced. Split them by whether
+        // the license was in that window at any point since we knew this expiration date.
+        Window windowWhenKnown = policy.classify(l.licenseExpiration(), knownSince(l));
+        List<Window> skipped = new ArrayList<>();
+        List<Window> passedBeforeKnown = new ArrayList<>();
+        for (Window w : WindowPolicy.alertingWindowsBefore(current)) {
+            if (!w.moreSevereThan(mostSevereSoFar)) continue;
+            if (windowWhenKnown.moreSevereThan(w)) passedBeforeKnown.add(w);
+            else skipped.add(w);
+        }
         return Optional.of(new Surfacing(l.key(), l.npi(), l.licenseNumber(), l.licenseState(),
-                current, l.licenseExpiration(), asOf, skipped, policy.version(), runId, now));
+                current, l.licenseExpiration(), asOf, List.copyOf(skipped), List.copyOf(passedBeforeKnown),
+                policy.version(), runId, now));
+    }
+
+    /** Snapshots written before expirationKnownSince existed fall back to the row's update time. */
+    private LocalDate knownSince(License l) {
+        return l.expirationKnownSince() != null
+                ? l.expirationKnownSince()
+                : LocalDate.ofInstant(l.updatedAt(), policy.zone());
     }
 }

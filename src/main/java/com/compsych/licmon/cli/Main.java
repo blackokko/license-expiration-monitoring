@@ -8,6 +8,7 @@ import com.compsych.licmon.domain.Provider;
 import com.compsych.licmon.domain.Surfacing;
 import com.compsych.licmon.domain.Window;
 import com.compsych.licmon.domain.WindowPolicy;
+import com.compsych.licmon.service.HealthCheck;
 import com.compsych.licmon.service.IntakeService;
 import com.compsych.licmon.service.MonitorService;
 import com.compsych.licmon.service.QueryService;
@@ -23,13 +24,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.LocalDate;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * CLI front end. "Today" comes from the injected Clock in the configured zone; every command that
@@ -40,12 +42,14 @@ public final class Main {
 
     private static final String USAGE = """
             usage: licmon [--state FILE] [--config FILE] <command> [args]
-              ingest <file.csv>                 load/upsert intake rows
-              run    [--as-of D]                surface newly-entered windows (idempotent)
+              ingest <file.csv> [--as-of D]     load/upsert intake rows (D = date the data is known)
+              run    [--as-of D] [--allow-future]  surface newly-entered windows (idempotent);
+                                                future dates refused unless --allow-future
               query  [--as-of D] [--window W]   list licenses by window (JSON lines)
               show   <state> <number> [--as-of D]
               history <state> <number>          surfacings for one license
-              status [--as-of D]                last run, staleness, counts per window
+              status [--as-of D]                health vs real today (exit 4 if unhealthy);
+                                                --as-of only moves the window counts
               demo   [<state> <number>]         walk one license OK -> EXPIRED on a scratch copy
             defaults: --state data/state.json  --config config/windows.json  --as-of today""";
 
@@ -77,12 +81,12 @@ public final class Main {
             List<String> rest = a.positional.subList(1, a.positional.size());
 
             return switch (cmd) {
-                case "ingest" -> ingest(store, file, rest);
-                case "run" -> run(store, file, policy, asOf);
+                case "ingest" -> ingest(store, file, rest, asOf);
+                case "run" -> run(store, file, policy, today, asOf, a.flags.contains("allow-future"));
                 case "query" -> query(store, policy, asOf, a.options.get("window"));
                 case "show" -> show(store, policy, asOf, rest);
                 case "history" -> history(store, rest);
-                case "status" -> status(store, policy, asOf);
+                case "status" -> status(store, policy, today, asOf);
                 case "demo" -> demo(store, policy, today, rest);
                 default -> {
                     out.println("unknown command: " + cmd);
@@ -96,18 +100,27 @@ public final class Main {
         }
     }
 
-    private int ingest(InMemoryStore store, SnapshotFile file, List<String> rest) throws IOException {
+    private int ingest(InMemoryStore store, SnapshotFile file, List<String> rest, LocalDate asOf) throws IOException {
         need(rest, 1, "ingest <file.csv>");
         IntakeService.Result r;
         try (Reader in = Files.newBufferedReader(Path.of(rest.get(0)), StandardCharsets.UTF_8)) {
-            r = new IntakeService(store, clock).ingestCsv(in);
+            r = new IntakeService(store, clock).ingestCsv(in, asOf);
         }
         file.save(store);
         printJson(r);
         return r.errors().isEmpty() ? 0 : 3;
     }
 
-    private int run(InMemoryStore store, SnapshotFile file, WindowPolicy policy, LocalDate asOf) throws IOException {
+    private int run(InMemoryStore store, SnapshotFile file, WindowPolicy policy, LocalDate today,
+                    LocalDate asOf, boolean allowFuture) throws IOException {
+        if (asOf.isAfter(today) && !allowFuture) {
+            // A future-dated run writes surfacings that would suppress the real alerts when those
+            // dates arrive. Refuse unless explicitly asked (e.g. against a scratch --state file).
+            out.println("error: refusing to run for " + asOf + ", after today " + today
+                    + ". Surfacings from a future run would suppress real alerts on those dates."
+                    + " Use 'demo', or a scratch --state file with --allow-future.");
+            return 5;
+        }
         warnIfBehindWatermark(store, asOf);
         MonitorService.RunResult r = new MonitorService(store, policy, clock).run(asOf);
         file.save(store);
@@ -143,25 +156,29 @@ public final class Main {
         return 0;
     }
 
-    private int status(InMemoryStore store, WindowPolicy policy, LocalDate asOf) throws JsonProcessingException {
-        List<MonitorRun> runs = store.runs();
-        Optional<MonitorRun> lastOk = runs.stream()
-                .filter(r -> r.status() == MonitorRun.Status.SUCCEEDED)
-                .max((x, y) -> x.asOf().compareTo(y.asOf()));
+    /**
+     * Health is judged against the real {@code today}; {@code --as-of} only changes which date the
+     * window counts are computed for. Exit code 4 when unhealthy, so cron/monitoring can alert on it.
+     */
+    private int status(InMemoryStore store, WindowPolicy policy, LocalDate today, LocalDate asOf) throws JsonProcessingException {
+        HealthCheck.Health h = new HealthCheck(HealthCheck.DEFAULT_MAX_DAYS_BEHIND).evaluate(store.runs(), today);
         Map<String, Object> s = new LinkedHashMap<>();
-        s.put("as_of", asOf.toString());
+        s.put("healthy", h.healthy());
+        s.put("problems", h.problems());
+        s.put("warnings", h.warnings());
+        s.put("today", today.toString());
+        s.put("last_successful_as_of", h.lastSuccessfulAsOf() == null ? null : h.lastSuccessfulAsOf().toString());
+        s.put("days_since_last_successful_run", h.daysSinceLastSuccessfulRun());
+        s.put("future_dated_runs", h.futureDatedRuns().stream().map(LocalDate::toString).toList());
+        s.put("last_run", h.lastRun());
         s.put("policy", policy.version());
         s.put("licenses", store.licenses().size());
-        s.put("last_run", runs.isEmpty() ? null : runs.get(runs.size() - 1));
-        s.put("last_successful_as_of", lastOk.map(r -> r.asOf().toString()).orElse(null));
-        long behind = lastOk.map(r -> ChronoUnit.DAYS.between(r.asOf(), asOf)).orElse(-1L);
-        s.put("days_since_last_successful_run", lastOk.isPresent() ? behind : null);
-        s.put("healthy", lastOk.isPresent() && behind <= 1);
+        s.put("counts_as_of", asOf.toString());
         Map<String, Integer> counts = new LinkedHashMap<>();
         new QueryService(store, policy).byWindow(asOf).forEach((w, vs) -> counts.put(w.name(), vs.size()));
         s.put("counts", counts);
         printJson(s);
-        return 0;
+        return h.healthy() ? 0 : 4;
     }
 
     /**
@@ -181,7 +198,7 @@ public final class Main {
             license = found.get();
             provider = store.provider(license.npi()).orElse(null);
         } else {
-            license = new License("1234567890", "NY-44821", "NY", today.plusDays(120), clock.instant());
+            license = new License("1234567890", "NY-44821", "NY", today.plusDays(120), today, clock.instant());
             provider = new Provider("1234567890", "Demo", "Provider", clock.instant());
         }
         InMemoryStore scratch = new InMemoryStore();
@@ -222,9 +239,12 @@ public final class Main {
         if (rest.size() < n) throw new IllegalArgumentException("usage: " + usage);
     }
 
-    /** --key value options anywhere; everything else positional. */
+    /** --key value options and --flag switches anywhere; everything else positional. */
     static final class Args {
+        static final Set<String> FLAGS = Set.of("allow-future");
+
         final Map<String, String> options = new HashMap<>();
+        final Set<String> flags = new HashSet<>();
         final List<String> positional = new ArrayList<>();
 
         String opt(String k, String def) {
@@ -234,7 +254,9 @@ public final class Main {
         static Args parse(String[] argv) {
             Args a = new Args();
             for (int i = 0; i < argv.length; i++) {
-                if (argv[i].startsWith("--")) {
+                if (argv[i].startsWith("--") && FLAGS.contains(argv[i].substring(2))) {
+                    a.flags.add(argv[i].substring(2));
+                } else if (argv[i].startsWith("--")) {
                     if (i + 1 >= argv.length) throw new IllegalArgumentException("missing value for " + argv[i]);
                     a.options.put(argv[i].substring(2), argv[++i]);
                 } else {
