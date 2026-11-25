@@ -31,3 +31,6 @@ bin/
 ### Build / runtime state ###
 target/
 data/
+
+# interview prompt (not published)
+PROMPT.md
